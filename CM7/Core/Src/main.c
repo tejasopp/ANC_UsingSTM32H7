@@ -18,7 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-
+#include <math.h>
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 
@@ -32,6 +32,8 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define BUFFER_SIZE 128
+#define FILTER_LEN 64
+#define STEP_SIZE 0.00005f
 #ifndef HSEM_ID_0
 #define HSEM_ID_0 (0U) /* HW semaphore 0*/
 #endif
@@ -52,6 +54,9 @@ DMA_HandleTypeDef hdma_spi2_rx;
 /* USER CODE BEGIN PV */
 int16_t adcData[BUFFER_SIZE];
 int16_t dacData[BUFFER_SIZE];
+float w[FILTER_LEN] = {0};       // Filter coefficients
+float x_buf[FILTER_LEN] = {0};   // Noise history buffer
+
 
 static volatile int16_t*inbufptr;
 static volatile int16_t*outbufptr;
@@ -80,8 +85,54 @@ void HAL_I2SEx_TxRxCpltCallback(I2S_HandleTypeDef*hi2s){
 	outbufptr = &dacData[BUFFER_SIZE/2];
 	datareadyflag = 1;
 }
-void ProcessData(){
+float lms_process(float d, float x) {
+    float y = 0.0f;
 
+    // Shift buffer (x[n-1]..x[n-N])
+    for (int i = FILTER_LEN - 1; i > 0; i--) {
+        x_buf[i] = x_buf[i - 1];
+    }
+    x_buf[0] = x;
+
+    // Compute output y[n] = Σ(w[i]*x[i])
+    for (int i = 0; i < FILTER_LEN; i++) {
+        y += w[i] * x_buf[i];
+    }
+
+    // Error signal
+    float e = d - y;
+
+    // LMS coefficient update
+    for (int i = 0; i < FILTER_LEN; i++) {
+        w[i] += 2 * STEP_SIZE * e * x_buf[i];
+    }
+
+    return e;
+}
+void ProcessData(){
+	for (int i = 0; i < BUFFER_SIZE; i += 2) {
+		// Read samples (assumed 16-bit signed PCM)
+		int16_t primary = inbufptr[i];     // signal + noise
+		int16_t reference = inbufptr[i+1]; // noise only
+
+		// Normalize to float [-1, 1]
+		float d = (float)primary / 32768.0f;
+		float x = (float)reference / 32768.0f;
+
+		// Apply LMS noise cancellation
+		float e = lms_process(d, x); 
+
+		// Scale to DAC 12-bit (0 - 4095)
+		uint16_t dac_val = (uint16_t)((e + 1.0f) * 2047.5f);
+		if (dac_val > 4095) dac_val = 4095;  // clamp
+
+		// Store to output buffer (same buffer used for I2S TX)
+		outbufptr[i] = (int16_t)((e + 1.0f) * 16383.5f) - 8192; // 16-bit signed for I2S
+		outbufptr[i+1] = outbufptr[i]; 
+
+		// Send to DAC (
+		HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, dac_val);
+	}
 }
 /* USER CODE END 0 */
 
